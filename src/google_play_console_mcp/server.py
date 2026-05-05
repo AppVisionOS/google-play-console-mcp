@@ -2064,8 +2064,163 @@ def get_external_transaction(
 
 
 # =========================================================================
+# READ TOOLS — Store Listing
+# =========================================================================
+
+
+@mcp.tool()
+def get_store_listing(language: str, package_name: str = "") -> str:
+    """Get the current store listing for a specific language.
+
+    Read-before-write helper. Creates a transient edit, reads the listing,
+    and abandons the edit (no mutation).
+
+    Args:
+        language: BCP-47 language code (e.g. 'en-US', 'tr-TR').
+        package_name: Android package name. Uses env default if empty.
+    """
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+
+        edit = svc.edits().insert(packageName=pkg, body={}).execute()
+        edit_id = edit["id"]
+
+        try:
+            listing = svc.edits().listings().get(
+                packageName=pkg, editId=edit_id, language=language
+            ).execute()
+            return _fmt(listing)
+        finally:
+            try:
+                svc.edits().delete(packageName=pkg, editId=edit_id).execute()
+            except Exception:
+                pass
+
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+@mcp.tool()
+def list_store_listings(package_name: str = "") -> str:
+    """List all store listings (per-locale) for an app.
+
+    Returns the language codes plus a snippet of each listing.
+    Creates a transient edit, lists, and abandons (no mutation).
+
+    Args:
+        package_name: Android package name. Uses env default if empty.
+    """
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+
+        edit = svc.edits().insert(packageName=pkg, body={}).execute()
+        edit_id = edit["id"]
+
+        try:
+            resp = svc.edits().listings().list(
+                packageName=pkg, editId=edit_id
+            ).execute()
+            listings = resp.get("listings", [])
+            return _fmt({
+                "package": pkg,
+                "total_locales": len(listings),
+                "listings": listings,
+            })
+        finally:
+            try:
+                svc.edits().delete(packageName=pkg, editId=edit_id).execute()
+            except Exception:
+                pass
+
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+# =========================================================================
 # WRITE TOOLS — Store Listing
 # =========================================================================
+
+
+@mcp.tool()
+def create_store_listing(
+    language: str,
+    title: str,
+    short_description: str,
+    full_description: str,
+    video: str = "",
+    package_name: str = "",
+) -> str:
+    """Create a NEW store listing for a language that doesn't have one yet.
+
+    Errors out if a listing already exists for the language — use
+    update_store_listing for existing locales.
+
+    Args:
+        language: BCP-47 language code (e.g. 'fr-FR', 'es-419').
+        title: App title (max 30 chars).
+        short_description: Short description (max 80 chars).
+        full_description: Full description (max 4000 chars).
+        video: Optional YouTube video URL.
+        package_name: Android package name. Uses env default if empty.
+    """
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+
+        edit = svc.edits().insert(packageName=pkg, body={}).execute()
+        edit_id = edit["id"]
+
+        try:
+            try:
+                existing = svc.edits().listings().get(
+                    packageName=pkg, editId=edit_id, language=language
+                ).execute()
+                if existing:
+                    return (
+                        f"Listing for '{language}' already exists. "
+                        f"Use update_store_listing to modify it."
+                    )
+            except HttpError as get_err:
+                if get_err.status_code != 404:
+                    raise
+
+            body: dict[str, Any] = {
+                "language": language,
+                "title": title,
+                "shortDescription": short_description,
+                "fullDescription": full_description,
+            }
+            if video:
+                body["video"] = video
+
+            result = svc.edits().listings().update(
+                packageName=pkg, editId=edit_id, language=language, body=body
+            ).execute()
+
+            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+
+            return _fmt({
+                "status": "created_and_committed",
+                "language": language,
+                "title": result.get("title"),
+            })
+        except Exception:
+            try:
+                svc.edits().delete(packageName=pkg, editId=edit_id).execute()
+            except Exception:
+                pass
+            raise
+
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except RuntimeError as exc:
+        return str(exc)
 
 
 @mcp.tool()
@@ -2939,6 +3094,48 @@ def delete_store_listing(language: str, package_name: str = "") -> str:
 
             svc.edits().commit(packageName=pkg, editId=edit_id).execute()
             return _fmt({"status": "deleted_and_committed", "language": language})
+        except Exception:
+            try:
+                svc.edits().delete(packageName=pkg, editId=edit_id).execute()
+            except Exception:
+                pass
+            raise
+
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+@mcp.tool()
+def delete_all_store_listings(package_name: str = "", confirm: bool = False) -> str:
+    """Delete ALL store listings (every locale) for an app — DESTRUCTIVE.
+
+    Requires confirm=True to proceed. Use with extreme care: this wipes the
+    entire localized store presence in a single committed edit.
+
+    Args:
+        package_name: Android package name. Uses env default if empty.
+        confirm: Must be True to actually run. Defaults to False as a safety guard.
+    """
+    if not confirm:
+        return (
+            "Refusing to run without confirm=True. This is destructive — "
+            "it will delete every per-locale store listing for the app."
+        )
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+
+        edit = svc.edits().insert(packageName=pkg, body={}).execute()
+        edit_id = edit["id"]
+
+        try:
+            svc.edits().listings().deleteall(
+                packageName=pkg, editId=edit_id
+            ).execute()
+            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            return _fmt({"status": "all_listings_deleted_and_committed", "package": pkg})
         except Exception:
             try:
                 svc.edits().delete(packageName=pkg, editId=edit_id).execute()
