@@ -2214,6 +2214,8 @@ def get_slow_start_rate(
 ) -> str:
     """Get slow app start rate metrics from Android Vitals.
 
+    The slowStartRateMetricSet requires the startType dimension (HOT/WARM/COLD).
+
     Args:
         start_date: Start date YYYY-MM-DD.
         end_date: End date YYYY-MM-DD.
@@ -2226,7 +2228,7 @@ def get_slow_start_rate(
             package_name=pkg,
             metric_set="slowStartRateMetricSet",
             metrics=["slowStartRate", "distinctUsers"],
-            dimensions=["versionCode"],
+            dimensions=["startType", "versionCode"],
             start_date=start_date,
             end_date=end_date,
             page_size=page_size,
@@ -2249,6 +2251,9 @@ def get_slow_rendering_rate(
 ) -> str:
     """Get slow rendering (UI jank) rate metrics from Android Vitals.
 
+    NOTE: This metric is only available for game apps (primary category = GAME).
+    Non-game apps will receive a 403 from the Reporting API.
+
     Args:
         start_date: Start date YYYY-MM-DD.
         end_date: End date YYYY-MM-DD.
@@ -2270,6 +2275,12 @@ def get_slow_rendering_rate(
         results = _parse_vitals_response(resp)
         return _fmt(results) if results else "No slow rendering rate data found."
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 403:
+            return (
+                "slowRenderingRate is only available for game apps "
+                "(primary category = GAME). This package is not a game; "
+                "use get_excessive_wakeup_rate or get_anr_rate instead."
+            )
         return f"Error: {exc.response.status_code} – {exc.response.text}"
     except RuntimeError as exc:
         return str(exc)
@@ -2385,82 +2396,87 @@ def get_error_rate(
 # =========================================================================
 
 
+_STORE_ACQUISITION_DIMENSIONS = {"country", "traffic_source"}
+_RATINGS_DIMENSIONS = {
+    "overview", "country", "app_version", "carrier", "device", "language", "os_version",
+}
+
+
 @mcp.tool()
 def get_store_acquisition_report(
-    start_date: str,
-    end_date: str,
+    year: int,
+    month: int,
     package_name: str = "",
-    page_size: int = 100,
+    dimension: str = "country",
 ) -> str:
-    """Get store listing acquisition metrics (visitors, installers, conversion).
+    """Get monthly store listing acquisition metrics (visitors, installers, conversion).
+
+    Reads from the Play Console GCS export bucket. Data is monthly granularity.
+    Reports for a given month typically appear within a few days after month end.
 
     Args:
-        start_date: Start date YYYY-MM-DD.
-        end_date: End date YYYY-MM-DD.
+        year: Report year (e.g. 2026).
+        month: Report month (1-12).
         package_name: Android package name. Uses env default if empty.
-        page_size: Max rows to return.
+        dimension: 'country' or 'traffic_source'. Defaults to 'country'.
     """
     try:
         pkg = _pkg(package_name or None)
-        path = f"/apps/{pkg}/storePerformanceMetricSet:query"
-        body: dict[str, Any] = {
-            "metrics": [
-                "storeListingVisitors",
-                "storeListingInstallers",
-                "storeListingConversionRate",
-            ],
-            "dimensions": ["countryCode"],
-            "timelineSpec": {
-                "aggregationPeriod": "DAILY",
-                "startTime": {"startTime": _date_to_reporting(start_date)},
-                "endTime": {"endTime": _date_to_reporting(end_date)},
-            },
-            "pageSize": page_size,
-        }
-        resp = _reporting_post(path, body)
-        results = _parse_vitals_response(resp)
-        return _fmt(results) if results else "No acquisition data found."
-    except httpx.HTTPStatusError as exc:
-        return f"Error: {exc.response.status_code} – {exc.response.text}"
-    except RuntimeError as exc:
-        return str(exc)
+        if dimension not in _STORE_ACQUISITION_DIMENSIONS:
+            return (
+                f"Invalid dimension '{dimension}'. "
+                f"Must be one of: {sorted(_STORE_ACQUISITION_DIMENSIONS)}."
+            )
+        blob_path = f"stats/store_performance/store_performance_{pkg}_{year}{month:02d}_{dimension}.csv"
+        rows = _read_gcs_csv_with_fallback(blob_path)
+        return _fmt({
+            "package": pkg,
+            "period": f"{year}-{month:02d}",
+            "dimension": dimension,
+            "total_rows": len(rows),
+            "rows": rows,
+        })
+    except Exception as exc:
+        return f"Error reading store acquisition report: {exc}"
 
 
 @mcp.tool()
 def get_ratings_overview(
-    start_date: str,
-    end_date: str,
+    year: int,
+    month: int,
     package_name: str = "",
-    page_size: int = 100,
+    dimension: str = "overview",
 ) -> str:
-    """Get app ratings distribution and average rating.
+    """Get monthly app ratings distribution from the Play Console GCS export.
+
+    Data is monthly granularity. Reports for a given month typically appear
+    within a few days after month end.
 
     Args:
-        start_date: Start date YYYY-MM-DD.
-        end_date: End date YYYY-MM-DD.
+        year: Report year (e.g. 2026).
+        month: Report month (1-12).
         package_name: Android package name. Uses env default if empty.
-        page_size: Max rows to return.
+        dimension: 'overview' (default), 'country', 'app_version', 'carrier',
+            'device', 'language', or 'os_version'.
     """
     try:
         pkg = _pkg(package_name or None)
-        path = f"/apps/{pkg}/ratingDistributionMetricSet:query"
-        body: dict[str, Any] = {
-            "metrics": ["totalRatings"],
-            "dimensions": ["starRating"],
-            "timelineSpec": {
-                "aggregationPeriod": "DAILY",
-                "startTime": {"startTime": _date_to_reporting(start_date)},
-                "endTime": {"endTime": _date_to_reporting(end_date)},
-            },
-            "pageSize": page_size,
-        }
-        resp = _reporting_post(path, body)
-        results = _parse_vitals_response(resp)
-        return _fmt(results) if results else "No ratings data found."
-    except httpx.HTTPStatusError as exc:
-        return f"Error: {exc.response.status_code} – {exc.response.text}"
-    except RuntimeError as exc:
-        return str(exc)
+        if dimension not in _RATINGS_DIMENSIONS:
+            return (
+                f"Invalid dimension '{dimension}'. "
+                f"Must be one of: {sorted(_RATINGS_DIMENSIONS)}."
+            )
+        blob_path = f"stats/ratings/ratings_{pkg}_{year}{month:02d}_{dimension}.csv"
+        rows = _read_gcs_csv_with_fallback(blob_path)
+        return _fmt({
+            "package": pkg,
+            "period": f"{year}-{month:02d}",
+            "dimension": dimension,
+            "total_rows": len(rows),
+            "rows": rows,
+        })
+    except Exception as exc:
+        return f"Error reading ratings overview: {exc}"
 
 
 # =========================================================================
