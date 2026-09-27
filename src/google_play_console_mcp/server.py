@@ -7,6 +7,7 @@ import io
 import json
 import os
 import time
+import zipfile
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Any
@@ -131,6 +132,25 @@ def _get_publisher_service():
     creds = _get_credentials()
     return build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
 
+
+def _commit_edit_with_fallback(svc, pkg: str, edit_id: str) -> dict[str, Any]:
+    """Commit an edit, retrying with changesNotSentForReview when Play refuses auto-review.
+
+    Play answers 400 \"Changes cannot be sent for review automatically\" for apps whose
+    edits must be submitted by hand. Retrying with changesNotSentForReview=true stores the
+    changes as a pending draft instead of failing the whole write.
+    """
+    try:
+        return dict(svc.edits().commit(packageName=pkg, editId=edit_id).execute() or {})
+    except HttpError as exc:
+        if "changesNotSentForReview" not in str(exc):
+            raise
+        resp = dict(svc.edits().commit(
+            packageName=pkg, editId=edit_id, changesNotSentForReview=True
+        ).execute() or {})
+        resp["changesNotSentForReview"] = True
+        resp["review_note"] = "Committed without automatic review - submit the changes in Play Console."
+        return resp
 
 def _get_gcs_client(legacy: bool = False) -> storage.Client:
     """Build a GCS client from the service account key.
@@ -1234,15 +1254,50 @@ def get_vitals_overview(
 # =========================================================================
 
 
-def _read_gcs_csv(bucket_name: str, blob_path: str, legacy: bool = False) -> list[dict]:
-    """Download a CSV from GCS and parse it into a list of dicts."""
-    client = _get_gcs_client(legacy=legacy)
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_path)
+def _decode_report(data: bytes) -> str:
+    """Decode a Play report: stats exports are UTF-16, financial reports UTF-8."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
 
-    content = blob.download_as_text(encoding="utf-16")
-    reader = csv.DictReader(io.StringIO(content))
-    return [row for row in reader]
+
+def _read_gcs_csv(bucket_name: str, blob_path: str, legacy: bool = False) -> list[dict]:
+    """Download a report from GCS and parse it into a list of dicts.
+
+    Financial reports are published as zips with a suffixed name
+    (earnings/earnings_202608_<id>-N.zip, sales/salesreport_202608.zip), so
+    when *blob_path* doesn't exist every blob sharing its stem is read and the
+    rows concatenated — a month can have one earnings file per payments profile.
+    """
+    client = _get_gcs_client(legacy=legacy)
+    blob = client.bucket(bucket_name).blob(blob_path)
+    if blob.exists():
+        blobs = [blob]
+    else:
+        stem = blob_path.removesuffix(".csv")
+        blobs = [
+            b for b in client.list_blobs(bucket_name, prefix=stem)
+            if b.name.endswith((".csv", ".zip"))
+        ]
+        if not blobs:
+            raise FileNotFoundError(f"gs://{bucket_name}/{stem}[*.csv|*.zip] not found")
+
+    rows: list[dict] = []
+    for b in blobs:
+        data = b.download_as_bytes()
+        if b.name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                texts = [_decode_report(zf.read(n)) for n in zf.namelist() if n.endswith(".csv")]
+        else:
+            texts = [_decode_report(data)]
+        for text in texts:
+            rows.extend(csv.DictReader(io.StringIO(text)))
+    return rows
+
+
+def _row_package(row: dict) -> str:
+    """Package name of a financial report row (column name varies by report/era)."""
+    return row.get("Package ID") or row.get("Product ID") or row.get("Product id") or ""
 
 
 def _gcs_bucket_name() -> str:
@@ -1268,11 +1323,17 @@ def _read_gcs_csv_with_fallback(blob_path: str) -> list[dict]:
     bucket_name = _gcs_bucket_name()
     try:
         return _read_gcs_csv(bucket_name, blob_path)
-    except Exception:
+    except Exception as primary_exc:
         legacy_bucket = _gcs_legacy_bucket_name()
-        if legacy_bucket:
+        if not legacy_bucket:
+            raise
+        try:
             return _read_gcs_csv(legacy_bucket, blob_path, legacy=True)
-        raise
+        except Exception as legacy_exc:
+            # Surface both failures — reporting only the legacy one hides the real cause.
+            raise RuntimeError(
+                f"primary {bucket_name}: {primary_exc} | legacy {legacy_bucket}: {legacy_exc}"
+            ) from legacy_exc
 
 
 @mcp.tool()
@@ -1294,21 +1355,22 @@ def get_sales_report(year: int, month: int, package_name: str = "") -> str:
 
         # Filter by package name if provided
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
         results = []
         for r in rows:
             results.append({
                 "order_id": r.get("Order Number") or r.get("Order Charged Date"),
-                "product_id": r.get("Product ID") or r.get("Product id"),
+                "product_id": _row_package(r),
                 "sku_id": r.get("SKU ID") or r.get("Sku Id"),
-                "description": r.get("Description"),
+                "product_type": r.get("Product Type"),
+                "description": r.get("Description") or r.get("Product Title"),
                 "currency": r.get("Currency of Sale") or r.get("Buyer Currency"),
                 "amount": r.get("Item Price") or r.get("Charged Amount"),
                 "tax": r.get("Taxes Collected"),
-                "transaction_type": r.get("Transaction Type"),
-                "country": r.get("Buyer Country"),
-                "state": r.get("Buyer State") or r.get("Buyer Postal Code"),
+                "transaction_type": r.get("Transaction Type") or r.get("Financial Status"),
+                "country": r.get("Buyer Country") or r.get("Country of Buyer"),
+                "state": r.get("Buyer State") or r.get("State of Buyer") or r.get("Buyer Postal Code"),
             })
 
         return _fmt({
@@ -1338,12 +1400,14 @@ def get_earnings_report(year: int, month: int, package_name: str = "") -> str:
         rows = _read_gcs_csv_with_fallback(blob_path)
 
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
         results = []
         for r in rows:
             results.append({
-                "product_id": r.get("Product ID") or r.get("Product id"),
+                "product_id": _row_package(r),
+                "sku_id": r.get("Sku Id") or r.get("SKU ID"),
+                "product_type": r.get("Product Type"),
                 "description": r.get("Description"),
                 "currency": r.get("Buyer Currency"),
                 "amount_buyer": r.get("Amount (Buyer Currency)"),
@@ -1381,12 +1445,14 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
         rows = _read_gcs_csv_with_fallback(blob_path)
 
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
-        # Aggregate by product + country
+        # Aggregate by product + country; total_amount is net payout (charges
+        # minus Google fees and refunds), by_transaction_type keeps the gross split.
         summary: dict[str, dict[str, Any]] = {}
+        by_type: dict[str, float] = {}
         for r in rows:
-            product = r.get("Product ID") or r.get("Product id") or "unknown"
+            product = _row_package(r) or "unknown"
             country = r.get("Buyer Country") or "unknown"
             key = f"{product}|{country}"
 
@@ -1406,6 +1472,8 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
                 }
             summary[key]["total_amount"] += amount
             summary[key]["transaction_count"] += 1
+            tx_type = r.get("Transaction Type") or "unknown"
+            by_type[tx_type] = by_type.get(tx_type, 0.0) + amount
 
         results = sorted(summary.values(), key=lambda x: x["total_amount"], reverse=True)
         for r in results:
@@ -1416,6 +1484,7 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
         return _fmt({
             "period": f"{year}-{month:02d}",
             "total_revenue": round(total_revenue, 2),
+            "by_transaction_type": {k: round(v, 2) for k, v in by_type.items()},
             "currency": results[0]["merchant_currency"] if results else "N/A",
             "products_count": len(set(r["product_id"] for r in results)),
             "countries_count": len(set(r["country"] for r in results)),
@@ -2203,7 +2272,7 @@ def create_store_listing(
                 packageName=pkg, editId=edit_id, language=language, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "created_and_committed",
@@ -2271,7 +2340,7 @@ def update_store_listing(
                 packageName=pkg, editId=edit_id, language=language, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "updated_and_committed",
@@ -2692,7 +2761,7 @@ def update_track(
                 packageName=pkg, editId=edit_id, track=track, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "updated_and_committed",
@@ -3054,7 +3123,7 @@ def update_app_details(
                 packageName=pkg, editId=edit_id, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({"status": "updated_and_committed", "details": result})
         except Exception:
@@ -3092,7 +3161,7 @@ def delete_store_listing(language: str, package_name: str = "") -> str:
                 packageName=pkg, editId=edit_id, language=language
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "deleted_and_committed", "language": language})
         except Exception:
             try:
@@ -3134,7 +3203,7 @@ def delete_all_store_listings(package_name: str = "", confirm: bool = False) -> 
             svc.edits().listings().deleteall(
                 packageName=pkg, editId=edit_id
             ).execute()
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "all_listings_deleted_and_committed", "package": pkg})
         except Exception:
             try:
@@ -3229,7 +3298,7 @@ def delete_store_image(
                 language=language, imageType=image_type, imageId=image_id
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "deleted_and_committed", "image_id": image_id})
         except Exception:
             try:
@@ -3312,7 +3381,7 @@ def update_testers(
                 packageName=pkg, editId=edit_id, track=track, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "updated_and_committed", "track": track, "testers": result})
         except Exception:
             try:
@@ -3596,7 +3665,7 @@ def commit_edit(edit_id: str, package_name: str = "") -> str:
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
-        resp = svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+        resp = _commit_edit_with_fallback(svc, pkg, edit_id)
         return _fmt(resp)
     except HttpError as exc:
         return f"Error: {exc.status_code} – {exc.reason}"
