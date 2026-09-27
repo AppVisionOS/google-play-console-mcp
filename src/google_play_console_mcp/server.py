@@ -9,6 +9,7 @@ import os
 import time
 import zipfile
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 from typing import Any
 
@@ -3990,28 +3991,232 @@ def get_onetime_product(product_id: str, package_name: str = "") -> str:
         return str(exc)
 
 
+def _money(currency: str, amount: str | Decimal) -> dict[str, Any]:
+    """Build a google.type.Money dict from a decimal amount such as '4.99'."""
+    value = Decimal(str(amount))
+    if value < 0:
+        raise ValueError(f"Price must not be negative: {amount}")
+    units = int(value)
+    return {
+        "currencyCode": currency.upper(),
+        "units": str(units),
+        "nanos": int((value - units) * 1_000_000_000),
+    }
+
+
+def _money_str(money: dict[str, Any]) -> str:
+    value = Decimal(money.get("units", "0")) + Decimal(money.get("nanos", 0)) / 1_000_000_000
+    return f"{value.normalize():f} {money.get('currencyCode', '')}"
+
+
+def _purchase_option_state_request(
+    pkg: str, product_id: str, purchase_option_id: str, active: bool
+) -> dict[str, Any]:
+    key = "activatePurchaseOptionRequest" if active else "deactivatePurchaseOptionRequest"
+    return {key: {
+        "packageName": pkg,
+        "productId": product_id,
+        "purchaseOptionId": purchase_option_id,
+    }}
+
+
 @mcp.tool()
 def create_onetime_product(
     product_id: str,
-    product_config_json: str,
+    title: str,
+    description: str,
+    price: str,
+    price_currency: str = "USD",
+    region_prices_json: str = "",
+    purchase_option_id: str = "legacy-base",
+    legacy_compatible: bool = True,
+    multi_quantity: bool = False,
+    language: str = "en-US",
+    activate: bool = False,
     package_name: str = "",
 ) -> str:
-    """Create a new one-time product.
+    """Create a new one-time (in-app) product with a single buy purchase option.
+
+    The base price is converted to every Play region via convertRegionPrices;
+    region_prices_json then overrides individual regions (e.g. for PPP pricing).
+    Refuses to touch a product ID that already exists. The purchase option is
+    created as DRAFT and only becomes purchasable once activated, either with
+    activate=True here or later via update_onetime_purchase_option_state.
 
     Args:
-        product_id: The product ID (SKU) for the new product.
-        product_config_json: JSON string with product configuration
-            (e.g. {"listings": {"en-US": {"title": "...", "description": "..."}},
-            "defaultPrice": {"currencyCode": "USD", "units": "1"}}).
+        product_id: New product ID. Lowercase letters, numbers, '_' and '.';
+            must start with a lowercase letter or number.
+        title: Listing title (max 55 chars).
+        description: Listing description (max 200 chars).
+        price: Base price as a decimal string in price_currency, e.g. '4.99'.
+        price_currency: ISO 4217 currency of the base price (default USD).
+        region_prices_json: Optional per-region overrides in each region's own
+            currency, e.g. '{"TR": "119.99", "IN": "99"}'.
+        purchase_option_id: Purchase option ID. Default 'legacy-base' matches
+            products migrated from the legacy in-app product model.
+        legacy_compatible: Make the option available to Play Billing Library
+            flows that predate the one-time products model (keep True unless
+            the app uses PBL 8+ purchase options).
+        multi_quantity: Allow buying more than one unit per checkout.
+        language: BCP-47 language of the listing (default en-US).
+        activate: Activate the purchase option right after creation.
         package_name: Android package name. Uses env default if empty.
     """
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
+        products = svc.monetization().onetimeproducts()
+
+        try:
+            products.get(packageName=pkg, productId=product_id).execute()
+            return (
+                f"Error: one-time product '{product_id}' already exists in {pkg}. "
+                f"Use update_onetime_product to change it."
+            )
+        except HttpError as exc:
+            if exc.status_code != 404:
+                raise
+
+        base = _money(price_currency, price)
+        converted = svc.monetization().convertRegionPrices(
+            packageName=pkg, body={"price": base}
+        ).execute()
+        region_prices = {
+            code: entry["price"]
+            for code, entry in converted.get("convertedRegionPrices", {}).items()
+        }
+        overrides = json.loads(region_prices_json) if region_prices_json else {}
+        for code, amount in overrides.items():
+            code = code.upper()
+            if code not in region_prices:
+                return f"Error: region '{code}' is not a Play billing region for {pkg}."
+            region_prices[code] = _money(region_prices[code]["currencyCode"], amount)
+
+        other = converted.get("convertedOtherRegionsPrice", {})
+        body = {
+            "packageName": pkg,
+            "productId": product_id,
+            "listings": [{
+                "languageCode": language,
+                "title": title,
+                "description": description,
+            }],
+            "purchaseOptions": [{
+                "purchaseOptionId": purchase_option_id,
+                "buyOption": {
+                    "legacyCompatible": legacy_compatible,
+                    "multiQuantityEnabled": multi_quantity,
+                },
+                "regionalPricingAndAvailabilityConfigs": [
+                    {"regionCode": code, "price": money, "availability": "AVAILABLE"}
+                    for code, money in sorted(region_prices.items())
+                ],
+                "newRegionsConfig": {
+                    "usdPrice": other["usdPrice"],
+                    "eurPrice": other["eurPrice"],
+                    "availability": "AVAILABLE",
+                },
+                "taxAndComplianceSettings": {
+                    "withdrawalRightType": "WITHDRAWAL_RIGHT_DIGITAL_CONTENT",
+                },
+            }],
+        }
+        product = products.patch(
+            packageName=pkg,
+            productId=product_id,
+            body=body,
+            allowMissing=True,
+            updateMask="listings,purchaseOptions",
+            regionsVersion_version=converted["regionVersion"]["version"],
+        ).execute()
+
+        if activate:
+            try:
+                resp = products.purchaseOptions().batchUpdateStates(
+                    packageName=pkg,
+                    productId=product_id,
+                    body={"requests": [
+                        _purchase_option_state_request(pkg, product_id, purchase_option_id, True)
+                    ]},
+                ).execute()
+            except HttpError as exc:
+                return (
+                    f"Product '{product_id}' was created but its purchase option is still DRAFT: "
+                    f"activation failed with {exc.status_code} – {exc.reason}. "
+                    f"Retry with update_onetime_purchase_option_state."
+                )
+            product = (resp.get("oneTimeProducts") or [product])[0]
+
+        option = product["purchaseOptions"][0]
+        prices = {
+            c["regionCode"]: _money_str(c["price"])
+            for c in option.get("regionalPricingAndAvailabilityConfigs", [])
+        }
+        return _fmt({
+            "status": "created",
+            "product_id": product["productId"],
+            "purchase_option_id": option["purchaseOptionId"],
+            "state": option.get("state"),
+            "regions_version": product.get("regionsVersion", {}).get("version"),
+            "region_count": len(prices),
+            "overridden_regions": {c.upper(): prices.get(c.upper()) for c in overrides},
+            "sample_prices": {c: prices.get(c) for c in ("US", "GB", "DE", "TR", "BR", "IN")},
+        })
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except json.JSONDecodeError as exc:
+        return f"Error: Invalid JSON in region_prices_json – {exc}"
+    except InvalidOperation:
+        return "Error: Prices must be decimal strings such as '4.99'."
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+@mcp.tool()
+def update_onetime_product(
+    product_id: str,
+    product_config_json: str,
+    update_mask: str = "",
+    package_name: str = "",
+) -> str:
+    """Update an existing one-time product (listings, purchase options, tags, tax settings).
+
+    Fields named in the update mask are replaced as a whole: to change one
+    price, send the full purchaseOptions list from get_onetime_product with
+    that price edited. Purchase option state cannot be changed here — use
+    update_onetime_purchase_option_state.
+
+    Args:
+        product_id: The product ID to update.
+        product_config_json: JSON object with OneTimeProduct fields, e.g.
+            '{"listings": [{"languageCode": "en-US", "title": "...", "description": "..."}]}'.
+        update_mask: Comma-separated fields to update. Defaults to the
+            top-level keys of product_config_json.
+        package_name: Android package name. Uses env default if empty.
+    """
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+        products = svc.monetization().onetimeproducts()
         body = json.loads(product_config_json)
-        body["productId"] = product_id
-        resp = svc.monetization().onetimeproducts().patch(
-            packageName=pkg, productId=product_id, body=body
+        for readonly in ("packageName", "productId", "regionsVersion"):
+            body.pop(readonly, None)
+        for option in body.get("purchaseOptions", []):
+            option.pop("state", None)
+        mask = update_mask or ",".join(body)
+        if not mask:
+            return "Error: product_config_json has no fields to update."
+
+        current = products.get(packageName=pkg, productId=product_id).execute()
+        body.update(packageName=pkg, productId=product_id)
+        resp = products.patch(
+            packageName=pkg,
+            productId=product_id,
+            body=body,
+            updateMask=mask,
+            regionsVersion_version=current["regionsVersion"]["version"],
         ).execute()
         return _fmt(resp)
     except HttpError as exc:
@@ -4023,30 +4228,40 @@ def create_onetime_product(
 
 
 @mcp.tool()
-def update_onetime_product(
+def update_onetime_purchase_option_state(
     product_id: str,
-    product_config_json: str,
+    active: bool,
+    purchase_option_id: str = "legacy-base",
     package_name: str = "",
 ) -> str:
-    """Update an existing one-time product.
+    """Activate or deactivate a one-time product purchase option.
+
+    Only ACTIVE purchase options can be bought; new ones start as DRAFT.
 
     Args:
-        product_id: The product ID (SKU) to update.
-        product_config_json: JSON string with fields to update.
+        product_id: The one-time product ID.
+        active: True to activate, False to deactivate.
+        purchase_option_id: Purchase option ID (default 'legacy-base').
         package_name: Android package name. Uses env default if empty.
     """
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
-        body = json.loads(product_config_json)
-        resp = svc.monetization().onetimeproducts().patch(
-            packageName=pkg, productId=product_id, body=body
+        resp = svc.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+            packageName=pkg,
+            productId=product_id,
+            body={"requests": [
+                _purchase_option_state_request(pkg, product_id, purchase_option_id, active)
+            ]},
         ).execute()
-        return _fmt(resp)
+        states = {
+            o["purchaseOptionId"]: o.get("state")
+            for p in resp.get("oneTimeProducts", [])
+            for o in p.get("purchaseOptions", [])
+        }
+        return _fmt({"product_id": product_id, "purchase_option_states": states})
     except HttpError as exc:
         return f"Error: {exc.status_code} – {exc.reason}"
-    except json.JSONDecodeError as exc:
-        return f"Error: Invalid JSON – {exc}"
     except RuntimeError as exc:
         return str(exc)
 
