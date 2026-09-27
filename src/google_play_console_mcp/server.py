@@ -7,7 +7,9 @@ import io
 import json
 import os
 import time
+import zipfile
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from functools import wraps
 from typing import Any
 
@@ -131,6 +133,25 @@ def _get_publisher_service():
     creds = _get_credentials()
     return build("androidpublisher", "v3", credentials=creds, cache_discovery=False)
 
+
+def _commit_edit_with_fallback(svc, pkg: str, edit_id: str) -> dict[str, Any]:
+    """Commit an edit, retrying with changesNotSentForReview when Play refuses auto-review.
+
+    Play answers 400 \"Changes cannot be sent for review automatically\" for apps whose
+    edits must be submitted by hand. Retrying with changesNotSentForReview=true stores the
+    changes as a pending draft instead of failing the whole write.
+    """
+    try:
+        return dict(svc.edits().commit(packageName=pkg, editId=edit_id).execute() or {})
+    except HttpError as exc:
+        if "changesNotSentForReview" not in str(exc):
+            raise
+        resp = dict(svc.edits().commit(
+            packageName=pkg, editId=edit_id, changesNotSentForReview=True
+        ).execute() or {})
+        resp["changesNotSentForReview"] = True
+        resp["review_note"] = "Committed without automatic review - submit the changes in Play Console."
+        return resp
 
 def _get_gcs_client(legacy: bool = False) -> storage.Client:
     """Build a GCS client from the service account key.
@@ -1234,15 +1255,50 @@ def get_vitals_overview(
 # =========================================================================
 
 
-def _read_gcs_csv(bucket_name: str, blob_path: str, legacy: bool = False) -> list[dict]:
-    """Download a CSV from GCS and parse it into a list of dicts."""
-    client = _get_gcs_client(legacy=legacy)
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_path)
+def _decode_report(data: bytes) -> str:
+    """Decode a Play report: stats exports are UTF-16, financial reports UTF-8."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
 
-    content = blob.download_as_text(encoding="utf-16")
-    reader = csv.DictReader(io.StringIO(content))
-    return [row for row in reader]
+
+def _read_gcs_csv(bucket_name: str, blob_path: str, legacy: bool = False) -> list[dict]:
+    """Download a report from GCS and parse it into a list of dicts.
+
+    Financial reports are published as zips with a suffixed name
+    (earnings/earnings_202608_<id>-N.zip, sales/salesreport_202608.zip), so
+    when *blob_path* doesn't exist every blob sharing its stem is read and the
+    rows concatenated — a month can have one earnings file per payments profile.
+    """
+    client = _get_gcs_client(legacy=legacy)
+    blob = client.bucket(bucket_name).blob(blob_path)
+    if blob.exists():
+        blobs = [blob]
+    else:
+        stem = blob_path.removesuffix(".csv")
+        blobs = [
+            b for b in client.list_blobs(bucket_name, prefix=stem)
+            if b.name.endswith((".csv", ".zip"))
+        ]
+        if not blobs:
+            raise FileNotFoundError(f"gs://{bucket_name}/{stem}[*.csv|*.zip] not found")
+
+    rows: list[dict] = []
+    for b in blobs:
+        data = b.download_as_bytes()
+        if b.name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                texts = [_decode_report(zf.read(n)) for n in zf.namelist() if n.endswith(".csv")]
+        else:
+            texts = [_decode_report(data)]
+        for text in texts:
+            rows.extend(csv.DictReader(io.StringIO(text)))
+    return rows
+
+
+def _row_package(row: dict) -> str:
+    """Package name of a financial report row (column name varies by report/era)."""
+    return row.get("Package ID") or row.get("Product ID") or row.get("Product id") or ""
 
 
 def _gcs_bucket_name() -> str:
@@ -1268,11 +1324,17 @@ def _read_gcs_csv_with_fallback(blob_path: str) -> list[dict]:
     bucket_name = _gcs_bucket_name()
     try:
         return _read_gcs_csv(bucket_name, blob_path)
-    except Exception:
+    except Exception as primary_exc:
         legacy_bucket = _gcs_legacy_bucket_name()
-        if legacy_bucket:
+        if not legacy_bucket:
+            raise
+        try:
             return _read_gcs_csv(legacy_bucket, blob_path, legacy=True)
-        raise
+        except Exception as legacy_exc:
+            # Surface both failures — reporting only the legacy one hides the real cause.
+            raise RuntimeError(
+                f"primary {bucket_name}: {primary_exc} | legacy {legacy_bucket}: {legacy_exc}"
+            ) from legacy_exc
 
 
 @mcp.tool()
@@ -1294,21 +1356,22 @@ def get_sales_report(year: int, month: int, package_name: str = "") -> str:
 
         # Filter by package name if provided
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
         results = []
         for r in rows:
             results.append({
                 "order_id": r.get("Order Number") or r.get("Order Charged Date"),
-                "product_id": r.get("Product ID") or r.get("Product id"),
+                "product_id": _row_package(r),
                 "sku_id": r.get("SKU ID") or r.get("Sku Id"),
-                "description": r.get("Description"),
+                "product_type": r.get("Product Type"),
+                "description": r.get("Description") or r.get("Product Title"),
                 "currency": r.get("Currency of Sale") or r.get("Buyer Currency"),
                 "amount": r.get("Item Price") or r.get("Charged Amount"),
                 "tax": r.get("Taxes Collected"),
-                "transaction_type": r.get("Transaction Type"),
-                "country": r.get("Buyer Country"),
-                "state": r.get("Buyer State") or r.get("Buyer Postal Code"),
+                "transaction_type": r.get("Transaction Type") or r.get("Financial Status"),
+                "country": r.get("Buyer Country") or r.get("Country of Buyer"),
+                "state": r.get("Buyer State") or r.get("State of Buyer") or r.get("Buyer Postal Code"),
             })
 
         return _fmt({
@@ -1338,12 +1401,14 @@ def get_earnings_report(year: int, month: int, package_name: str = "") -> str:
         rows = _read_gcs_csv_with_fallback(blob_path)
 
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
         results = []
         for r in rows:
             results.append({
-                "product_id": r.get("Product ID") or r.get("Product id"),
+                "product_id": _row_package(r),
+                "sku_id": r.get("Sku Id") or r.get("SKU ID"),
+                "product_type": r.get("Product Type"),
                 "description": r.get("Description"),
                 "currency": r.get("Buyer Currency"),
                 "amount_buyer": r.get("Amount (Buyer Currency)"),
@@ -1381,12 +1446,14 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
         rows = _read_gcs_csv_with_fallback(blob_path)
 
         if pkg:
-            rows = [r for r in rows if r.get("Product ID", "").startswith(pkg) or r.get("Product id", "").startswith(pkg)]
+            rows = [r for r in rows if _row_package(r).startswith(pkg)]
 
-        # Aggregate by product + country
+        # Aggregate by product + country; total_amount is net payout (charges
+        # minus Google fees and refunds), by_transaction_type keeps the gross split.
         summary: dict[str, dict[str, Any]] = {}
+        by_type: dict[str, float] = {}
         for r in rows:
-            product = r.get("Product ID") or r.get("Product id") or "unknown"
+            product = _row_package(r) or "unknown"
             country = r.get("Buyer Country") or "unknown"
             key = f"{product}|{country}"
 
@@ -1406,6 +1473,8 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
                 }
             summary[key]["total_amount"] += amount
             summary[key]["transaction_count"] += 1
+            tx_type = r.get("Transaction Type") or "unknown"
+            by_type[tx_type] = by_type.get(tx_type, 0.0) + amount
 
         results = sorted(summary.values(), key=lambda x: x["total_amount"], reverse=True)
         for r in results:
@@ -1416,6 +1485,7 @@ def get_revenue_summary(year: int, month: int, package_name: str = "") -> str:
         return _fmt({
             "period": f"{year}-{month:02d}",
             "total_revenue": round(total_revenue, 2),
+            "by_transaction_type": {k: round(v, 2) for k, v in by_type.items()},
             "currency": results[0]["merchant_currency"] if results else "N/A",
             "products_count": len(set(r["product_id"] for r in results)),
             "countries_count": len(set(r["country"] for r in results)),
@@ -2203,7 +2273,7 @@ def create_store_listing(
                 packageName=pkg, editId=edit_id, language=language, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "created_and_committed",
@@ -2271,7 +2341,7 @@ def update_store_listing(
                 packageName=pkg, editId=edit_id, language=language, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "updated_and_committed",
@@ -2692,7 +2762,7 @@ def update_track(
                 packageName=pkg, editId=edit_id, track=track, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({
                 "status": "updated_and_committed",
@@ -3054,7 +3124,7 @@ def update_app_details(
                 packageName=pkg, editId=edit_id, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
 
             return _fmt({"status": "updated_and_committed", "details": result})
         except Exception:
@@ -3092,7 +3162,7 @@ def delete_store_listing(language: str, package_name: str = "") -> str:
                 packageName=pkg, editId=edit_id, language=language
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "deleted_and_committed", "language": language})
         except Exception:
             try:
@@ -3134,7 +3204,7 @@ def delete_all_store_listings(package_name: str = "", confirm: bool = False) -> 
             svc.edits().listings().deleteall(
                 packageName=pkg, editId=edit_id
             ).execute()
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "all_listings_deleted_and_committed", "package": pkg})
         except Exception:
             try:
@@ -3229,7 +3299,7 @@ def delete_store_image(
                 language=language, imageType=image_type, imageId=image_id
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "deleted_and_committed", "image_id": image_id})
         except Exception:
             try:
@@ -3312,7 +3382,7 @@ def update_testers(
                 packageName=pkg, editId=edit_id, track=track, body=body
             ).execute()
 
-            svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+            _commit_edit_with_fallback(svc, pkg, edit_id)
             return _fmt({"status": "updated_and_committed", "track": track, "testers": result})
         except Exception:
             try:
@@ -3596,7 +3666,7 @@ def commit_edit(edit_id: str, package_name: str = "") -> str:
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
-        resp = svc.edits().commit(packageName=pkg, editId=edit_id).execute()
+        resp = _commit_edit_with_fallback(svc, pkg, edit_id)
         return _fmt(resp)
     except HttpError as exc:
         return f"Error: {exc.status_code} – {exc.reason}"
@@ -3921,28 +3991,232 @@ def get_onetime_product(product_id: str, package_name: str = "") -> str:
         return str(exc)
 
 
+def _money(currency: str, amount: str | Decimal) -> dict[str, Any]:
+    """Build a google.type.Money dict from a decimal amount such as '4.99'."""
+    value = Decimal(str(amount))
+    if value < 0:
+        raise ValueError(f"Price must not be negative: {amount}")
+    units = int(value)
+    return {
+        "currencyCode": currency.upper(),
+        "units": str(units),
+        "nanos": int((value - units) * 1_000_000_000),
+    }
+
+
+def _money_str(money: dict[str, Any]) -> str:
+    value = Decimal(money.get("units", "0")) + Decimal(money.get("nanos", 0)) / 1_000_000_000
+    return f"{value.normalize():f} {money.get('currencyCode', '')}"
+
+
+def _purchase_option_state_request(
+    pkg: str, product_id: str, purchase_option_id: str, active: bool
+) -> dict[str, Any]:
+    key = "activatePurchaseOptionRequest" if active else "deactivatePurchaseOptionRequest"
+    return {key: {
+        "packageName": pkg,
+        "productId": product_id,
+        "purchaseOptionId": purchase_option_id,
+    }}
+
+
 @mcp.tool()
 def create_onetime_product(
     product_id: str,
-    product_config_json: str,
+    title: str,
+    description: str,
+    price: str,
+    price_currency: str = "USD",
+    region_prices_json: str = "",
+    purchase_option_id: str = "legacy-base",
+    legacy_compatible: bool = True,
+    multi_quantity: bool = False,
+    language: str = "en-US",
+    activate: bool = False,
     package_name: str = "",
 ) -> str:
-    """Create a new one-time product.
+    """Create a new one-time (in-app) product with a single buy purchase option.
+
+    The base price is converted to every Play region via convertRegionPrices;
+    region_prices_json then overrides individual regions (e.g. for PPP pricing).
+    Refuses to touch a product ID that already exists. The purchase option is
+    created as DRAFT and only becomes purchasable once activated, either with
+    activate=True here or later via update_onetime_purchase_option_state.
 
     Args:
-        product_id: The product ID (SKU) for the new product.
-        product_config_json: JSON string with product configuration
-            (e.g. {"listings": {"en-US": {"title": "...", "description": "..."}},
-            "defaultPrice": {"currencyCode": "USD", "units": "1"}}).
+        product_id: New product ID. Lowercase letters, numbers, '_' and '.';
+            must start with a lowercase letter or number.
+        title: Listing title (max 55 chars).
+        description: Listing description (max 200 chars).
+        price: Base price as a decimal string in price_currency, e.g. '4.99'.
+        price_currency: ISO 4217 currency of the base price (default USD).
+        region_prices_json: Optional per-region overrides in each region's own
+            currency, e.g. '{"TR": "119.99", "IN": "99"}'.
+        purchase_option_id: Purchase option ID. Default 'legacy-base' matches
+            products migrated from the legacy in-app product model.
+        legacy_compatible: Make the option available to Play Billing Library
+            flows that predate the one-time products model (keep True unless
+            the app uses PBL 8+ purchase options).
+        multi_quantity: Allow buying more than one unit per checkout.
+        language: BCP-47 language of the listing (default en-US).
+        activate: Activate the purchase option right after creation.
         package_name: Android package name. Uses env default if empty.
     """
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
+        products = svc.monetization().onetimeproducts()
+
+        try:
+            products.get(packageName=pkg, productId=product_id).execute()
+            return (
+                f"Error: one-time product '{product_id}' already exists in {pkg}. "
+                f"Use update_onetime_product to change it."
+            )
+        except HttpError as exc:
+            if exc.status_code != 404:
+                raise
+
+        base = _money(price_currency, price)
+        converted = svc.monetization().convertRegionPrices(
+            packageName=pkg, body={"price": base}
+        ).execute()
+        region_prices = {
+            code: entry["price"]
+            for code, entry in converted.get("convertedRegionPrices", {}).items()
+        }
+        overrides = json.loads(region_prices_json) if region_prices_json else {}
+        for code, amount in overrides.items():
+            code = code.upper()
+            if code not in region_prices:
+                return f"Error: region '{code}' is not a Play billing region for {pkg}."
+            region_prices[code] = _money(region_prices[code]["currencyCode"], amount)
+
+        other = converted.get("convertedOtherRegionsPrice", {})
+        body = {
+            "packageName": pkg,
+            "productId": product_id,
+            "listings": [{
+                "languageCode": language,
+                "title": title,
+                "description": description,
+            }],
+            "purchaseOptions": [{
+                "purchaseOptionId": purchase_option_id,
+                "buyOption": {
+                    "legacyCompatible": legacy_compatible,
+                    "multiQuantityEnabled": multi_quantity,
+                },
+                "regionalPricingAndAvailabilityConfigs": [
+                    {"regionCode": code, "price": money, "availability": "AVAILABLE"}
+                    for code, money in sorted(region_prices.items())
+                ],
+                "newRegionsConfig": {
+                    "usdPrice": other["usdPrice"],
+                    "eurPrice": other["eurPrice"],
+                    "availability": "AVAILABLE",
+                },
+                "taxAndComplianceSettings": {
+                    "withdrawalRightType": "WITHDRAWAL_RIGHT_DIGITAL_CONTENT",
+                },
+            }],
+        }
+        product = products.patch(
+            packageName=pkg,
+            productId=product_id,
+            body=body,
+            allowMissing=True,
+            updateMask="listings,purchaseOptions",
+            regionsVersion_version=converted["regionVersion"]["version"],
+        ).execute()
+
+        if activate:
+            try:
+                resp = products.purchaseOptions().batchUpdateStates(
+                    packageName=pkg,
+                    productId=product_id,
+                    body={"requests": [
+                        _purchase_option_state_request(pkg, product_id, purchase_option_id, True)
+                    ]},
+                ).execute()
+            except HttpError as exc:
+                return (
+                    f"Product '{product_id}' was created but its purchase option is still DRAFT: "
+                    f"activation failed with {exc.status_code} – {exc.reason}. "
+                    f"Retry with update_onetime_purchase_option_state."
+                )
+            product = (resp.get("oneTimeProducts") or [product])[0]
+
+        option = product["purchaseOptions"][0]
+        prices = {
+            c["regionCode"]: _money_str(c["price"])
+            for c in option.get("regionalPricingAndAvailabilityConfigs", [])
+        }
+        return _fmt({
+            "status": "created",
+            "product_id": product["productId"],
+            "purchase_option_id": option["purchaseOptionId"],
+            "state": option.get("state"),
+            "regions_version": product.get("regionsVersion", {}).get("version"),
+            "region_count": len(prices),
+            "overridden_regions": {c.upper(): prices.get(c.upper()) for c in overrides},
+            "sample_prices": {c: prices.get(c) for c in ("US", "GB", "DE", "TR", "BR", "IN")},
+        })
+    except HttpError as exc:
+        return f"Error: {exc.status_code} – {exc.reason}"
+    except json.JSONDecodeError as exc:
+        return f"Error: Invalid JSON in region_prices_json – {exc}"
+    except InvalidOperation:
+        return "Error: Prices must be decimal strings such as '4.99'."
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except RuntimeError as exc:
+        return str(exc)
+
+
+@mcp.tool()
+def update_onetime_product(
+    product_id: str,
+    product_config_json: str,
+    update_mask: str = "",
+    package_name: str = "",
+) -> str:
+    """Update an existing one-time product (listings, purchase options, tags, tax settings).
+
+    Fields named in the update mask are replaced as a whole: to change one
+    price, send the full purchaseOptions list from get_onetime_product with
+    that price edited. Purchase option state cannot be changed here — use
+    update_onetime_purchase_option_state.
+
+    Args:
+        product_id: The product ID to update.
+        product_config_json: JSON object with OneTimeProduct fields, e.g.
+            '{"listings": [{"languageCode": "en-US", "title": "...", "description": "..."}]}'.
+        update_mask: Comma-separated fields to update. Defaults to the
+            top-level keys of product_config_json.
+        package_name: Android package name. Uses env default if empty.
+    """
+    try:
+        pkg = _pkg(package_name or None)
+        svc = _get_publisher_service()
+        products = svc.monetization().onetimeproducts()
         body = json.loads(product_config_json)
-        body["productId"] = product_id
-        resp = svc.monetization().onetimeproducts().patch(
-            packageName=pkg, productId=product_id, body=body
+        for readonly in ("packageName", "productId", "regionsVersion"):
+            body.pop(readonly, None)
+        for option in body.get("purchaseOptions", []):
+            option.pop("state", None)
+        mask = update_mask or ",".join(body)
+        if not mask:
+            return "Error: product_config_json has no fields to update."
+
+        current = products.get(packageName=pkg, productId=product_id).execute()
+        body.update(packageName=pkg, productId=product_id)
+        resp = products.patch(
+            packageName=pkg,
+            productId=product_id,
+            body=body,
+            updateMask=mask,
+            regionsVersion_version=current["regionsVersion"]["version"],
         ).execute()
         return _fmt(resp)
     except HttpError as exc:
@@ -3954,30 +4228,40 @@ def create_onetime_product(
 
 
 @mcp.tool()
-def update_onetime_product(
+def update_onetime_purchase_option_state(
     product_id: str,
-    product_config_json: str,
+    active: bool,
+    purchase_option_id: str = "legacy-base",
     package_name: str = "",
 ) -> str:
-    """Update an existing one-time product.
+    """Activate or deactivate a one-time product purchase option.
+
+    Only ACTIVE purchase options can be bought; new ones start as DRAFT.
 
     Args:
-        product_id: The product ID (SKU) to update.
-        product_config_json: JSON string with fields to update.
+        product_id: The one-time product ID.
+        active: True to activate, False to deactivate.
+        purchase_option_id: Purchase option ID (default 'legacy-base').
         package_name: Android package name. Uses env default if empty.
     """
     try:
         pkg = _pkg(package_name or None)
         svc = _get_publisher_service()
-        body = json.loads(product_config_json)
-        resp = svc.monetization().onetimeproducts().patch(
-            packageName=pkg, productId=product_id, body=body
+        resp = svc.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+            packageName=pkg,
+            productId=product_id,
+            body={"requests": [
+                _purchase_option_state_request(pkg, product_id, purchase_option_id, active)
+            ]},
         ).execute()
-        return _fmt(resp)
+        states = {
+            o["purchaseOptionId"]: o.get("state")
+            for p in resp.get("oneTimeProducts", [])
+            for o in p.get("purchaseOptions", [])
+        }
+        return _fmt({"product_id": product_id, "purchase_option_states": states})
     except HttpError as exc:
         return f"Error: {exc.status_code} – {exc.reason}"
-    except json.JSONDecodeError as exc:
-        return f"Error: Invalid JSON – {exc}"
     except RuntimeError as exc:
         return str(exc)
 
